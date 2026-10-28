@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Duenner JNI-Wrapper um espeak-ng — genau die vier Aufrufe, die die
+// Windows-Referenz macht (Belege: scripts/golden/generieren.py).
+//
+// Nebenlaeufigkeit: espeak ist NICHT threadsicher. Die Kotlin-Seite
+// (EspeakNative) serialisiert jeden Zugriff ueber ein einziges Lock;
+// dieser Wrapper verlaesst sich darauf und haelt selbst keine Locks.
+
+#include <android/log.h>
+#include <jni.h>
+#include <string.h>
+#include <espeak-ng/speak_lib.h>
+
+// Exakt die Referenzwerte (phonemizer EspeakWrapper.text_to_phonemes):
+// text_mode 1 = UTF-8; phonemes_mode = '_'<<8 | 0x02 = IPA mit '_'-Separator.
+#define KOKOLY_TEXT_MODE 1
+#define KOKOLY_PHONEME_MODE ((((int)'_') << 8) | 0x02)
+
+JNIEXPORT jint JNICALL
+Java_de_tilly_kokoly_tts_pipeline_EspeakNative_nativeInit(
+        JNIEnv *env, jclass clazz, jstring dataPath) {
+    const char *path = (*env)->GetStringUTFChars(env, dataPath, NULL);
+    // 0x02 = AUDIO_OUTPUT_SYNCHRONOUS — wie die Referenz; Audio wird nie erzeugt,
+    // wir nutzen ausschliesslich espeak_TextToPhonemes.
+    int rate = espeak_Initialize(0x02, 0, path, 0);
+    (*env)->ReleaseStringUTFChars(env, dataPath, path);
+    return rate; // > 0 = ok (Abtastrate), sonst Fehler
+}
+
+JNIEXPORT jint JNICALL
+Java_de_tilly_kokoly_tts_pipeline_EspeakNative_nativeSetVoice(
+        JNIEnv *env, jclass clazz, jstring voiceId) {
+    const char *id = (*env)->GetStringUTFChars(env, voiceId, NULL);
+    int rc = espeak_SetVoiceByName(id);
+    (*env)->ReleaseStringUTFChars(env, voiceId, id);
+    return rc; // 0 = EE_OK
+}
+
+JNIEXPORT jstring JNICALL
+Java_de_tilly_kokoly_tts_pipeline_EspeakNative_nativeTextToPhonemes(
+        JNIEnv *env, jclass clazz, jstring text) {
+    const char *utf8 = (*env)->GetStringUTFChars(env, text, NULL);
+    const void *ptr = utf8;
+
+    // Die Referenzschleife: TextToPhonemes liefert je Aufruf einen Satzteil
+    // und rueckt den Zeiger vor; Teile werden mit ' ' verbunden.
+    // static ist sicher: die Kotlin-Seite serialisiert JEDEN espeak-Zugriff
+    // ueber ein globales Lock. 64 KiB fassen auch interpunktionslose Chunks
+    // an der 4000-Zeichen-Grenze des TTS-Frameworks; laeuft der Puffer doch
+    // ueber, wird der Verlust GEMELDET, nie still verschluckt (Regel 2).
+    static char puffer[65536];
+    size_t belegt = 0;
+    puffer[0] = '\0';
+    while (ptr != NULL) {
+        const char *teil = espeak_TextToPhonemes(&ptr, KOKOLY_TEXT_MODE, KOKOLY_PHONEME_MODE);
+        if (teil == NULL || teil[0] == '\0') continue;
+        size_t laenge = strlen(teil);
+        if (belegt + laenge + 2 >= sizeof(puffer)) {
+            __android_log_print(ANDROID_LOG_WARN, "KokolyEspeak",
+                "Phonempuffer voll (%zu Bytes) - Rest des Chunks verworfen",
+                sizeof(puffer));
+            break;
+        }
+        if (belegt > 0) puffer[belegt++] = ' ';
+        memcpy(puffer + belegt, teil, laenge);
+        belegt += laenge;
+        puffer[belegt] = '\0';
+    }
+
+    (*env)->ReleaseStringUTFChars(env, text, utf8);
+    return (*env)->NewStringUTF(env, puffer);
+}
+
+JNIEXPORT void JNICALL
+Java_de_tilly_kokoly_tts_pipeline_EspeakNative_nativeTerminate(
+        JNIEnv *env, jclass clazz) {
+    espeak_Terminate();
+}
